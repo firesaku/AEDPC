@@ -4,9 +4,11 @@
   <img src="assets/aedpc-overview.gif" width="720" alt="Animated overview of AEDPC: density-flow components, local ellipses, contact checks and cluster reconstruction on two interleaved crescents">
 </p>
 
-<p align="center">
-  <a href="assets/AEDPC_mechanism.mp4"><b>▶ Watch the full walkthrough (MP4, 1080p, 75 s)</b></a>
-</p>
+The full mechanism walkthrough (1080p, 75 s; [download MP4](assets/AEDPC_mechanism.mp4)):
+
+https://github.com/user-attachments/assets/212c9ebc-cd68-4b4c-8ba0-4f6586fdc5e9
+
+
 
 A cluster that bends, widens or splits into several dense regions cannot be described by one centre or one global shape. Density peaks find the dense regions, but someone still has to decide **which regions belong together**.
 
