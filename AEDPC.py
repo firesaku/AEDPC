@@ -1,21 +1,16 @@
-"""AEDPC: single-file implementation of the proposed clustering method.
+"""AEDPC: readable single-file algorithm implementation.
 
-The implementation includes adaptive density estimation, density-flow routing,
-local ellipsoid construction, contact evidence, and certified reconstruction.
-Internal statistical and geometric tests belong to the clustering algorithm.
-No baseline algorithms, experiment runners, or result-analysis scripts are included.
-
-Use Python 3.12 with the accompanying requirements and license records.
+Generated only from the explicitly selected src/aedpcv2 modules. No comparison
+algorithms, experiment runners, embedded archives or dynamic loaders are included.
 
 Entry points:
-    AEDPC / AutomaticAEDPCv2: automatic parent/fusion certification.
-    AEDPCCore / AEDPCv2: core engine, including the dedicated STL10 settings.
-    AEDPCConfig / AEDPCv2Config: algorithm configuration.
+    AEDPC / AutomaticAEDPCv2: automatic parent/fusion selector.
+    AEDPCCore / AEDPCv2: configurable core estimator (including the visual profile).
+    AEDPCConfig / AEDPCv2Config: full research configuration.
+    PublicAEDPCv2 / PublicAEDPCv2Config: legacy restricted public core wrapper.
 
-Example (X is a samples-by-features NumPy array):
-    from AEDPC import AEDPC, AEDPCConfig
-    config = AEDPCConfig(neighbor_backend="exact")
-    labels = AEDPC(alpha_n=0.01, alpha_m=0.05, config=config).fit_predict(X)
+The automatic and core entries intentionally retain different behavior.
+Dependencies are the same as those of the modular source.
 """
 
 from __future__ import annotations
@@ -61,13 +56,14 @@ class AEDPCv2Config:
     fusion_mode: Literal[
         "automatic", "correction", "stability", "hybrid", "null", "greedy", "none"
     ] = "correction"
-    density_mode: Literal["pak"] = "pak"
+    density_mode: Literal["pak", "bmti", "knn30"] = "pak"
+    oas_shrinkage_multiplier: float = 1.0
     pak_solver: Literal["auto", "optimized", "pointwise"] = "auto"
     low_id_cutoff: float = 2.5
-    optional_repair: Literal[False] = False
+    optional_repair: bool = False
     shared_neighbor_evidence: bool = True
     topology_supported_ellipsoid: bool = False
-    ellipsoid_contact_mode: Literal["cross", "center"] = "cross"
+    ellipsoid_contact_mode: Literal["cross", "center", "center_same_kernel"] = "cross"
     markov_time_mode: Literal["adaptive", "one_step"] = "adaptive"
     density_topography: bool = True
     sequential_null: bool = True
@@ -77,12 +73,15 @@ class AEDPCv2Config:
     crossfit_ellipsoidal_speciation: bool = True
     speciation_conditioned_topography: bool = True
     certified_collapse_guard: bool = True
+    geometry_ablation: Literal["full", "spherical", "none"] = "full"
 
     def __post_init__(self) -> None:
-        if self.density_mode != "pak":
-            raise ValueError("AEDPC uses PAk density; density_mode must be 'pak'")
-        if self.optional_repair is not False:
-            raise ValueError("optional_repair is not part of the AEDPC method")
+        if self.density_mode not in {"pak", "bmti", "knn30"}:
+            raise ValueError("density_mode must be pak, bmti, or knn30")
+        if self.oas_shrinkage_multiplier not in {0.5, 1.0, 2.0}:
+            raise ValueError("oas_shrinkage_multiplier must be 0.5, 1.0, or 2.0")
+        if self.geometry_ablation not in {"full", "spherical", "none"}:
+            raise ValueError("geometry_ablation must be full, spherical, or none")
         if not 0 < self.alpha_n < 1:
             raise ValueError("alpha_n must lie in (0, 1)")
         if not 0 < self.alpha_m < 1:
@@ -140,8 +139,35 @@ def mean_impute_zscore(X: ArrayLike) -> tuple[NDArray[np.float64], dict[str, NDA
     return standardized, {"mean": means, "scale": scales, "constant": constant}
 
 
+def robust_scale(values: ArrayLike, epsilon: float = 1e-12) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float(epsilon)
+    median = np.median(values)
+    return float(max(1.4826 * np.median(np.abs(values - median)), epsilon))
 
 
+def weighted_median(values: ArrayLike, weights: ArrayLike) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if values.size == 0:
+        return float("inf")
+    if values.shape != weights.shape:
+        raise ValueError("values and weights must have identical shapes")
+    finite = np.isfinite(values) & np.isfinite(weights)
+    values = values[finite]
+    weights = weights[finite]
+    if values.size == 0:
+        return float("inf")
+    order = np.lexsort((np.arange(values.size), values))
+    sorted_values = values[order]
+    sorted_weights = np.maximum(weights[order], 0.0)
+    total = float(sorted_weights.sum())
+    if total <= 0:
+        return float(np.median(values))
+    position = int(np.searchsorted(np.cumsum(sorted_weights), 0.5 * total, side="left"))
+    return float(sorted_values[min(position, sorted_values.size - 1)])
 
 
 def relabel_consecutive(labels: ArrayLike) -> NDArray[np.int64]:
@@ -321,8 +347,48 @@ class DensityResult:
     dadapy_version: str
     pak_optimized: bool
     pak_equal_shells: int
+    density_estimator: str = "pak"
+    density_neighbors: int | None = None
 
 
+def run_bmti(
+    coordinates: NDArray[np.float64],
+    distances: NDArray[np.float64],
+    indices: NDArray[np.int64],
+    base: DensityResult,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Run the official DADApy BMTI estimator as a declared density ablation."""
+    from dadapy import Data
+
+    data = Data(
+        coordinates=np.asarray(coordinates, dtype=np.float64),
+        distances=(np.asarray(distances, dtype=np.float64), np.asarray(indices, dtype=np.int64)),
+        maxk=distances.shape[1] - 1,
+        verbose=False,
+        n_jobs=1,
+    )
+    data.intrinsic_dim = base.intrinsic_dimension
+    data.kstar = base.kstar
+    with contextlib.redirect_stdout(io.StringIO()):
+        output = data.compute_density_BMTI(
+            delta_F_inv_cov="uncorr",
+            comp_log_den_err=False,
+            solver="sp_direct",
+            alpha=1,
+            log_den=base.log_density,
+            log_den_err=base.log_density_error,
+        )
+    if isinstance(output, tuple):
+        log_density = np.asarray(output[0], dtype=np.float64)
+        error = np.asarray(output[1], dtype=np.float64) if len(output) > 1 else base.log_density_error
+    else:
+        log_density = np.asarray(data.log_den, dtype=np.float64)
+        error = (
+            np.asarray(data.log_den_err, dtype=np.float64)
+            if data.log_den_err is not None
+            else base.log_density_error
+        )
+    return log_density, error
 
 
 def run_abide_pak(
@@ -330,7 +396,11 @@ def run_abide_pak(
     indices: NDArray[np.int64],
     config: AEDPCv2Config,
 ) -> DensityResult:
-    """Run DADApy 0.3.4 ABIDE iterations followed by official PAk density."""
+    """Run official ABIDE, then PAk or the declared fixed-kNN density control.
+
+    DADApy's compute_density_kNN changes its own kstar; the ABIDE kstar is
+    restored before exposing routing information. No neighbor cache is expanded.
+    """
     try:
         import dadapy
         from dadapy import Data
@@ -353,6 +423,14 @@ def run_abide_pak(
     rank_floor = tie_scale * np.arange(1, positive.shape[1] + 1, dtype=np.float64)
     positive[zero_mask] = np.broadcast_to(rank_floor, positive.shape)[zero_mask]
     maxk = safe_distances.shape[1] - 1
+    density_neighbors = None
+    if config.density_mode == "knn30":
+        density_neighbors = min(30, safe_distances.shape[0] - 1)
+        if maxk < density_neighbors:
+            raise ValueError(
+                "density_mode='knn30' requires cached neighbors >= min(30,n-1); "
+                "the ABIDE/routing cache is not silently expanded"
+            )
     data = Data(
         distances=(safe_distances, np.asarray(indices, dtype=np.int64)),
         maxk=maxk,
@@ -393,12 +471,22 @@ def run_abide_pak(
                 # point-wise solver is mathematically equivalent and terminates
                 # promptly on those data.
                 pak_optimized = equal_shells == 0
-            log_density, log_density_error = data.compute_density_PAk(
-                alpha=config.alpha_n,
-                optimized=pak_optimized,
-                bonferroni_deloc=False,
-                bonferroni_loc=False,
-            )
+            if config.density_mode == "knn30":
+                abide_kstar = np.asarray(data.kstar, dtype=np.int64).copy()
+                try:
+                    log_density, log_density_error = data.compute_density_kNN(
+                        k=density_neighbors, bias=False,
+                    )
+                finally:
+                    data.kstar = abide_kstar
+                pak_optimized = False  # PAk has not run in this density control.
+            else:
+                log_density, log_density_error = data.compute_density_PAk(
+                    alpha=config.alpha_n,
+                    optimized=pak_optimized,
+                    bonferroni_deloc=False,
+                    bonferroni_loc=False,
+                )
     finally:
         np.random.set_state(legacy_state)
     kstar = np.asarray(data.kstar, dtype=np.int64)
@@ -417,6 +505,8 @@ def run_abide_pak(
         dadapy_version=version("dadapy"),
         pak_optimized=pak_optimized,
         pak_equal_shells=equal_shells,
+        density_estimator="knn30" if config.density_mode == "knn30" else "pak",
+        density_neighbors=density_neighbors,
     )
 
 
@@ -498,11 +588,12 @@ def lower_confidence_prominence(
 """Intrinsic-subspace shrinkage ellipsoids for density-flow micro-components."""
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import NDArray
-from sklearn.covariance import OAS
+from scipy.linalg import pinvh
+from sklearn.covariance import OAS, empirical_covariance, shrunk_covariance
 from sklearn.decomposition import PCA
 
 
@@ -564,7 +655,10 @@ def fit_ellipsoids(
     full_space: bool = False,
     reliability_blend: bool = True,
     support_neighbors: list[set[int]] | None = None,
+    oas_shrinkage_multiplier: float = 1.0,
 ) -> tuple[list[Ellipsoid], NDArray[np.float64]]:
+    if oas_shrinkage_multiplier not in {0.5, 1.0, 2.0}:
+        raise ValueError("oas_shrinkage_multiplier must be 0.5, 1.0, or 2.0")
     n, dimension = X.shape
     q = int(np.clip(np.rint(intrinsic_dimension), 1, dimension))
     point_weights = np.ones(n, dtype=np.float64)
@@ -615,6 +709,17 @@ def fit_ellipsoids(
             else:
                 raw_residual = isotropic_variance
             oas_shrinkage = float(np.clip(oas.shrinkage_, 0.0, 1.0))
+            if oas_shrinkage_multiplier != 1.0:
+                # Match OAS.fit's centered empirical covariance. Keep its native
+                # covariance/precision untouched at the default multiplier.
+                oas_shrinkage = float(np.clip(
+                    oas.shrinkage_ * oas_shrinkage_multiplier, 0.0, 1.0,
+                ))
+                empirical = empirical_covariance(
+                    projected - oas.location_, assume_centered=True,
+                )
+                covariance = shrunk_covariance(empirical, shrinkage=oas_shrinkage)
+                precision = pinvh(covariance, check_finite=False)
             residual_variance = max(
                 (1.0 - oas_shrinkage) * raw_residual
                 + oas_shrinkage * isotropic_variance,
@@ -704,6 +809,50 @@ def _weights(distance: NDArray[np.float64], zeta: float) -> NDArray[np.float64]:
     return np.clip(2.0 * beta / (1.0 + beta * beta), 0.0, 1.0)
 
 
+def spherical_shape_control(
+    X: NDArray[np.float64],
+    ellipsoids: list[Ellipsoid],
+    boundary_coverage: float,
+    epsilon: float,
+) -> tuple[list[Ellipsoid], NDArray[np.float64]]:
+    """Replace the calibrated Full metric by its variance-matched sphere.
+
+    Call only after the original Full geometry calibration.  An empty basis makes
+    squared_distance exactly ||x-center||^2 / isotropic_variance.  Keep the Full
+    fit's directional_reliability as support metadata for reconstruction gates;
+    it no longer blends distances when the operational basis is empty.  This is
+    separate from the legacy radius-based geometry_mode="spherical".
+    """
+    spherical: list[Ellipsoid] = []
+    point_weights = np.ones(X.shape[0], dtype=np.float64)
+    for fitted in ellipsoids:
+        basis = np.empty((fitted.center.size, 0), dtype=np.float64)
+        covariance = np.empty((0, 0), dtype=np.float64)
+        precision = np.empty((0, 0), dtype=np.float64)
+        for array in (basis, covariance, precision):
+            array.setflags(write=False)
+        proto = replace(
+            fitted,
+            basis=basis,
+            covariance=covariance,
+            precision=precision,
+            residual_variance=fitted.isotropic_variance,
+            axis_ratio=1.0,
+            geometry_kind="spherical-shape-control",
+        )
+        raw = proto.distance(X[fitted.members])
+        zeta = max(float(np.quantile(raw, boundary_coverage)), np.sqrt(epsilon))
+        weights = (
+            np.ones(fitted.members.size, dtype=np.float64)
+            if fitted.small_component else _weights(raw, zeta)
+        )
+        weights.setflags(write=False)
+        point_weights[fitted.members] = weights
+        spherical.append(replace(proto, zeta=zeta, boundary_weights=weights))
+    point_weights.setflags(write=False)
+    return spherical, point_weights
+
+
 def ellipsoid_compatibility(left: Ellipsoid, right: Ellipsoid, epsilon: float) -> float:
     left_view = float(left.distance(right.center[None, :])[0]) / max(left.zeta, epsilon)
     right_view = float(right.distance(left.center[None, :])[0]) / max(right.zeta, epsilon)
@@ -739,6 +888,26 @@ def cross_envelope_compatibility(
     if total <= epsilon:
         return float(np.mean(scores))
     return float(np.clip(np.sum(contact_weights * scores) / total, 0.0, 1.0))
+
+
+def center_same_kernel_compatibility(
+    left: Ellipsoid,
+    right: Ellipsoid,
+    contact_pairs: list[tuple[int, int, float]],
+    contact_weights: NDArray[np.float64],
+    epsilon: float,
+) -> float:
+    """Use the cross-envelope kernel at centers, retaining contact weights.
+
+    Only the two evaluation locations change.  Repeating the centers for each
+    observed contact preserves the original weighting, empty-contact behavior,
+    and zero-total-weight fallback.  The legacy center kernel remains separate.
+    """
+    centers = np.vstack((left.center, right.center))
+    center_pairs = [(0, 1, similarity) for _, _, similarity in contact_pairs]
+    return cross_envelope_compatibility(
+        left, right, centers, center_pairs, contact_weights, epsilon
+    )
 
 # ============================================================================
 # Original module: aedpcv2/graph.py
@@ -794,7 +963,12 @@ def build_micro_graph(
     ascent_ranks: list[dict[int, int]] | None = None,
     evidence: str = "BGF",
     geometry_mode: str = "cross",
+    geometry_ablation: str = "full",
 ) -> list[MicroEdge]:
+    if geometry_ablation not in {"full", "spherical", "none"}:
+        raise ValueError("geometry_ablation must be full, spherical, or none")
+    if geometry_ablation == "none":
+        boundary_weights = np.ones(labels.size, dtype=np.float64)
     n_components = int(labels.max()) + 1
     degrees = np.asarray([len(neighbors) for neighbors in reciprocal], dtype=np.float64)
     volumes = np.bincount(
@@ -843,7 +1017,9 @@ def build_micro_graph(
         score_sum = float(pair_weights.sum())
         denominator = float(volumes[left] + volumes[right])
         boundary = float(np.clip(2.0 * score_sum / max(denominator, epsilon), 0.0, 1.0))
-        if geometry_mode == "cross":
+        if geometry_ablation == "none":
+            geometry = 1.0
+        elif geometry_mode == "cross":
             geometry = cross_envelope_compatibility(
                 ellipsoids[left],
                 ellipsoids[right],
@@ -855,6 +1031,10 @@ def build_micro_graph(
         elif geometry_mode == "center":
             geometry = ellipsoid_compatibility(
                 ellipsoids[left], ellipsoids[right], epsilon
+            )
+        elif geometry_mode == "center_same_kernel":
+            geometry = center_same_kernel_compatibility(
+                ellipsoids[left], ellipsoids[right], pairs, pair_weights, epsilon
             )
         else:
             raise ValueError(f"unknown ellipsoid contact mode: {geometry_mode}")
@@ -1117,6 +1297,8 @@ def adaptive_neighbor_sets(
     return candidate, reciprocal
 
 
+def reciprocal_edges(reciprocal: list[set[int]]) -> list[tuple[int, int]]:
+    return [(i, j) for i, neighbors in enumerate(reciprocal) for j in sorted(neighbors) if i < j]
 
 
 def reverse_neighbor_saturation_scale(indices: NDArray[np.int64]) -> tuple[int, int]:
@@ -1183,6 +1365,36 @@ def reciprocal_percolation_scale(
     return lower + int(np.argmax(jumps))
 
 
+def reciprocal_topology_closure(
+    candidate: list[set[int]],
+    reciprocal: list[set[int]],
+    indices: NDArray[np.int64],
+) -> tuple[list[set[int]], int]:
+    """Give every reciprocal isolate one deterministic topology-supported edge."""
+
+    closed = [set(row) for row in reciprocal]
+    rank = [
+        {int(node): position for position, node in enumerate(indices[i, 1:], start=1)}
+        for i in range(indices.shape[0])
+    ]
+    added = 0
+    for i in range(len(closed)):
+        if closed[i]:
+            continue
+        choices = candidate[i]
+        if not choices:
+            continue
+
+        def key(j: int) -> tuple[float, int, int]:
+            union = candidate[i] | candidate[j]
+            overlap = len(candidate[i] & candidate[j]) / len(union) if union else 0.0
+            return overlap, -rank[i][j], -j
+
+        neighbor = max(choices, key=key)
+        closed[i].add(neighbor)
+        closed[neighbor].add(i)
+        added += 1
+    return closed, added
 
 
 def calibrated_neighbor_sets(
@@ -1795,6 +2007,12 @@ class MarkovCorrectionStep:
     multigraph_fallbacks: int
 
 
+def weighted_adjacency(n_nodes: int, edges: list[MicroEdge]) -> NDArray[np.float64]:
+    adjacency = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+    for edge in edges:
+        adjacency[edge.left, edge.right] = edge.weight
+        adjacency[edge.right, edge.left] = edge.weight
+    return adjacency
 
 
 def stationary_set_flow(
@@ -1811,8 +2029,37 @@ def stationary_set_flow(
     return float(cut / (2.0 * np.sqrt(max(volume_left * volume_right, epsilon))))
 
 
+def matrix_stationary_set_flow(
+    adjacency: NDArray[np.float64], left: set[int], right: set[int]
+) -> float:
+    """Reference matrix calculation used to verify the analytic expression."""
+    degrees = adjacency.sum(axis=1)
+    total = float(degrees.sum())
+    if total <= 0:
+        return 0.0
+    transition = np.eye(adjacency.shape[0]) * 0.5
+    nonzero = degrees > 0
+    transition[nonzero] += 0.5 * adjacency[nonzero] / degrees[nonzero, None]
+    stationary = degrees / total
+    left_idx = np.fromiter(sorted(left), dtype=np.int64)
+    right_idx = np.fromiter(sorted(right), dtype=np.int64)
+    directed = float(
+        (stationary[left_idx, None] * transition[np.ix_(left_idx, right_idx)]).sum()
+    )
+    mass_left = float(stationary[left_idx].sum())
+    mass_right = float(stationary[right_idx].sum())
+    return directed / np.sqrt(mass_left * mass_right) if mass_left and mass_right else 0.0
 
 
+def _best_pair(adjacency: NDArray[np.float64], groups: list[set[int]]) -> tuple[int, int, float] | None:
+    best: tuple[int, int, float] | None = None
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            score = stationary_set_flow(adjacency, groups[i], groups[j])
+            candidate = (i, j, score)
+            if score > 0 and (best is None or (score, -i, -j) > (best[2], -best[0], -best[1])):
+                best = candidate
+    return best
 
 
 def _best_pair_edges(
@@ -1888,8 +2135,51 @@ def _rewired_edge_list(
     return null_pairs, null_weights, successful, requested, degenerate, fallback
 
 
+def _rewired_adjacency(
+    adjacency: NDArray[np.float64],
+    rng: np.random.Generator,
+    swaps_per_edge: int,
+) -> tuple[NDArray[np.float64], int, int, bool, bool]:
+    rows, cols = np.triu_indices_from(adjacency, k=1)
+    present = adjacency[rows, cols] > 0
+    edge_pairs = list(zip(rows[present].tolist(), cols[present].tolist()))
+    weights = adjacency[rows[present], cols[present]].copy()
+    n_edges = len(edge_pairs)
+    requested = swaps_per_edge * n_edges
+    if n_edges < 2 or requested == 0:
+        return adjacency.copy(), 0, requested, True, False
+    graph = nx.Graph()
+    graph.add_nodes_from(range(adjacency.shape[0]))
+    graph.add_edges_from(edge_pairs)
+    before = {tuple(sorted(edge)) for edge in graph.edges()}
+    successful = 0
+    fallback = False
+    try:
+        seed = int(rng.integers(0, np.iinfo(np.int32).max))
+        nx.double_edge_swap(graph, nswap=requested, max_tries=max(requested * 30, 100), seed=seed)
+        successful = requested
+    except (nx.NetworkXAlgorithmError, nx.NetworkXError):
+        # A configuration-model multigraph preserves degrees exactly. Parallel edges are
+        # accumulated in the returned weighted adjacency and explicitly recorded.
+        degree_sequence = [degree for _, degree in graph.degree()]
+        seed = int(rng.integers(0, np.iinfo(np.int32).max))
+        multigraph = nx.configuration_model(degree_sequence, seed=seed)
+        graph = nx.Graph()
+        graph.add_nodes_from(range(adjacency.shape[0]))
+        graph.add_edges_from((u, v) for u, v in multigraph.edges() if u != v)
+        fallback = True
+    shuffled = weights[rng.permutation(weights.size)]
+    null = np.zeros_like(adjacency)
+    for index, (left, right) in enumerate(sorted(graph.edges())):
+        weight = float(shuffled[index % shuffled.size])
+        null[left, right] += weight
+        null[right, left] += weight
+    degenerate = bool(np.array_equal(null > 0, adjacency > 0))
+    return null, successful, requested, degenerate, fallback
 
 
+def degree_sequence(adjacency: NDArray[np.float64]) -> NDArray[np.int64]:
+    return np.count_nonzero(adjacency > 0, axis=1).astype(np.int64)
 
 
 def density_topography_components(
@@ -2118,7 +2408,7 @@ def _select_count_plateau_index(
     connected_components_count: int,
     epsilon: float = 1e-12,
 ) -> tuple[int, str]:
-    """Frozen r25 count-only selector retained solely for a controlled ablation."""
+    """Count-only plateau selector for controlled ablation."""
 
     counts = [int(np.unique(partition).size) for partition in partitions]
     for index in range(len(counts) - 1):
@@ -2700,6 +2990,8 @@ def evidence_gap_components(
     total_points: int,
     near_global_coverage: float,
     epsilon: float = 1e-12,
+    *,
+    geometry_ablation: str = "full",
 ) -> tuple[NDArray[np.int64], dict[str, object]]:
     """Fuse BGF components, resolving a near-global component by its strongest MST gap.
 
@@ -2731,12 +3023,17 @@ def evidence_gap_components(
             accepted_components += 1
             continue
 
-        component_reliability = np.asarray(
-            directional_reliability[list(nodes)], dtype=np.float64
-        )
-        median_reliability = float(np.median(component_reliability))
-        reliable_nodes = int(np.count_nonzero(component_reliability > 0))
-        if 2 * reliable_nodes <= len(nodes):
+        if geometry_ablation == "none":
+            # Remove only the ellipsoid-direction gate; retain the original graph gap rule.
+            median_reliability = None
+            reliable_nodes = None
+        else:
+            component_reliability = np.asarray(
+                directional_reliability[list(nodes)], dtype=np.float64
+            )
+            median_reliability = float(np.median(component_reliability))
+            reliable_nodes = int(np.count_nonzero(component_reliability > 0))
+        if geometry_ablation != "none" and 2 * reliable_nodes <= len(nodes):
             groups.extend({node} for node in sorted(nodes))
             unresolved_components += 1
             gap_records.append(
@@ -3253,6 +3550,54 @@ def coarsen_to_certified_state_floor(
     return labels, history
 
 
+def markov_stability_contributions(
+    macro_by_micro: NDArray[np.int64],
+    micro_sizes: NDArray[np.int64],
+    edges: list[MicroEdge],
+    epsilon: float = 1e-12,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float64]]:
+    """Classify macro-states by signed one-step Markov-stability contribution.
+
+    Coarse-graining must preserve transport that remains inside a density-flow basin. A basin with
+    ``n_b`` observations has exactly ``n_b-1`` parent edges and one root, hence diagonal retention
+    ``(n_b-1)/n_b``. This statistic is zero for an isolated point and approaches one for a coherent
+    large basin; it introduces no tuned self-loop mass.
+    """
+
+    macro = relabel_consecutive(np.asarray(macro_by_micro, dtype=np.int64))
+    sizes = np.asarray(micro_sizes, dtype=np.float64)
+    n_micro = macro.size
+    if sizes.shape != (n_micro,) or np.any(sizes < 1):
+        raise ValueError("every micro-component must contain at least one observation")
+    adjacency = np.zeros((n_micro, n_micro), dtype=np.float64)
+    adjacency[np.arange(n_micro), np.arange(n_micro)] = (sizes - 1.0) / sizes
+    for edge in edges:
+        if np.isfinite(edge.weight) and edge.weight > 0:
+            adjacency[edge.left, edge.right] = edge.weight
+            adjacency[edge.right, edge.left] = edge.weight
+    if not np.all(np.isfinite(adjacency)):
+        raise RuntimeError("macro recurrence graph contains non-finite transport")
+
+    n_macro = int(macro.max()) + 1
+    degree = adjacency.sum(axis=1)
+    total = float(degree.sum())
+    contribution = np.zeros(n_macro, dtype=np.float64)
+    closed = np.zeros(n_macro, dtype=bool)
+    if total > epsilon:
+        for state in range(n_macro):
+            nodes = np.flatnonzero(macro == state)
+            internal = float(adjacency[np.ix_(nodes, nodes)].sum())
+            volume = float(degree[nodes].sum())
+            contribution[state] = internal / total - (volume / total) ** 2
+            cut = max(volume - internal, 0.0)
+            closed[state] = bool(volume > epsilon and cut <= epsilon)
+    recurrent = np.flatnonzero((contribution > epsilon) | closed)
+    recurrent_set = set(map(int, recurrent))
+    transient = np.asarray(
+        [state for state in range(n_macro) if state not in recurrent_set],
+        dtype=np.int64,
+    )
+    return recurrent, transient, contribution
 
 
 def null_calibrated_recurrent_states(
@@ -3543,6 +3888,171 @@ def recurrent_ellipsoidal_absorption(
         "absorption_records": records,
     }
 
+
+def recurrent_graph_flow_absorption(
+    micro_labels: NDArray[np.int64],
+    macro_by_micro: NDArray[np.int64],
+    edges: list[MicroEdge],
+    epsilon: float = 1e-12,
+    alpha: float = 0.05,
+    permutations: int = 499,
+    seed: int = 20260824,
+) -> tuple[NDArray[np.int64], dict[str, object]]:
+    """No-ellipsoid replacement with the frozen core-selection rule and floor one.
+
+    Initial macro-states are not split or intersected with graph components. The
+    original conditional recurrence, positive-contribution relaxation, promotion
+    and tie rules are retained verbatim with minimum_states=1. Promotion is an
+    operational choice, not a significant statistical result. Only the geometric
+    entry-energy assignment is replaced by greedy stationary set flow over
+    observed positive edges. Unreachable states remain; no geometric fallback.
+    """
+    micro = np.asarray(micro_labels, dtype=np.int64)
+    macro = relabel_consecutive(np.asarray(macro_by_micro, dtype=np.int64))
+    n_micro = int(micro.max()) + 1
+    if macro.shape != (n_micro,):
+        raise ValueError("micro labels and macro mapping must agree")
+    micro_sizes = np.bincount(micro, minlength=n_micro)
+    minimum_states = 1
+    recurrent, transient, contribution, recurrence_p, null_diagnostics = (
+        null_calibrated_recurrent_states(
+            macro,
+            micro_sizes,
+            edges,
+            alpha,
+            permutations,
+            seed,
+            epsilon,
+        )
+    )
+    state_floor = min(max(int(minimum_states), 1), int(macro.max()) + 1)
+    macro_mass = np.bincount(
+        macro, weights=micro_sizes, minlength=int(macro.max()) + 1
+    )
+    promoted: list[int] = []
+    calibration_admissible = recurrent.size >= state_floor
+    if recurrent.size < state_floor:
+        closed = set(map(int, null_diagnostics.get("closed_states", [])))
+        recurrent = np.asarray(
+            [
+                state
+                for state, value in enumerate(contribution)
+                if value > epsilon or state in closed
+            ],
+            dtype=np.int64,
+        )
+        if recurrent.size < state_floor:
+            observed_retention = np.asarray(
+                null_diagnostics.get(
+                    "observed_state_retention", np.zeros(macro_mass.size)
+                ),
+                dtype=np.float64,
+            )
+            recurrent_set = set(map(int, recurrent))
+            candidates = [
+                state for state in range(macro_mass.size) if state not in recurrent_set
+            ]
+            candidates.sort(
+                key=lambda state: (
+                    float(recurrence_p[state]),
+                    -float(contribution[state]),
+                    -float(observed_retention[state]),
+                    -float(macro_mass[state]),
+                    state,
+                )
+            )
+            promoted = candidates[: state_floor - recurrent.size]
+            recurrent = np.asarray(
+                sorted([*map(int, recurrent), *promoted]), dtype=np.int64
+            )
+        recurrent_set = set(map(int, recurrent))
+        transient = np.asarray(
+            [state for state in range(macro_mass.size) if state not in recurrent_set],
+            dtype=np.int64,
+        )
+    null_diagnostics["certified_minimum_states"] = state_floor
+    null_diagnostics["calibration_admissible"] = calibration_admissible
+    null_diagnostics["underidentified_action"] = (
+        "not-applicable"
+        if calibration_admissible
+        else "retain-uncalibrated-positive-recurrence-and-promote-to-certified-floor"
+        if promoted
+        else "retain-uncalibrated-positive-recurrence"
+    )
+    null_diagnostics["minimum_state_floor_applied"] = bool(promoted)
+    null_diagnostics["floor_promoted_states"] = promoted
+    if not recurrent.size:
+        recurrent = np.asarray([int(np.argmax(macro_mass))], dtype=np.int64)
+        transient = np.asarray(
+            [state for state in range(macro_mass.size) if state != recurrent[0]],
+            dtype=np.int64,
+        )
+
+    valid_edges = [edge for edge in edges if np.isfinite(edge.weight) and edge.weight > 0]
+    selected = macro.copy()
+    cores = set(map(int, recurrent))
+    remaining = set(map(int, transient))
+    degree = np.zeros(n_micro, dtype=np.float64)
+    for edge in valid_edges:
+        degree[edge.left] += edge.weight
+        degree[edge.right] += edge.weight
+    records: list[dict[str, object]] = []
+    while remaining and cores:
+        volume = np.bincount(selected, weights=degree)
+        mass = np.bincount(selected, weights=micro_sizes)
+        contacts: dict[tuple[int, int], float] = {}
+        for edge in valid_edges:
+            left, right = int(selected[edge.left]), int(selected[edge.right])
+            if left in remaining and right in cores:
+                pair = (left, right)
+            elif right in remaining and left in cores:
+                pair = (right, left)
+            else:
+                continue
+            contacts[pair] = contacts.get(pair, 0.0) + float(edge.weight)
+        candidates: list[tuple[float, float, float, int, int]] = []
+        for (state, core), cross in contacts.items():
+            if cross > 0:
+                score = cross / (
+                    2.0 * np.sqrt(max(float(volume[state] * volume[core]), epsilon))
+                )
+                candidates.append((score, cross, float(mass[core]), core, state))
+        if not candidates:
+            break
+        score, cross, _, core, state = max(
+            candidates, key=lambda item: (item[0], item[1], item[2], -item[3], -item[4])
+        )
+        observations = int(mass[state])
+        selected[selected == state] = core
+        remaining.remove(state)
+        records.append({
+            "transient_state": state,
+            "absorbing_core": core,
+            "stationary_set_flow": float(score),
+            "cross_weight": float(cross),
+            "observations": observations,
+        })
+    selected = relabel_consecutive(selected)
+    return selected, {
+        "mode": "recurrent-graph-set-flow-absorption",
+        "status": (
+            "transient-states-absorbed" if records
+            else "all-states-recurrent" if not transient.size
+            else "unreachable-transient-states-retained"
+        ),
+        "initial_states": int(np.unique(macro).size),
+        "selected_states": int(np.unique(selected).size),
+        "support_refinement_applied": False,
+        "recurrent_states": int(recurrent.size),
+        "transient_states": int(transient.size),
+        "retained_without_reachable_core": sorted(remaining),
+        "parent_flow_retention": ((micro_sizes - 1.0) / micro_sizes).tolist(),
+        "stability_contribution": contribution.tolist(),
+        "recurrence_p_values": recurrence_p.tolist(),
+        "recurrence_null": null_diagnostics,
+        "absorption_records": records,
+    }
+
 # ============================================================================
 # Original module: aedpcv2/model.py
 # ============================================================================
@@ -3592,6 +4102,7 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
         configuration = self.config or AEDPCv2Config(alpha_n=self.alpha_n, alpha_m=self.alpha_m)
         if configuration.alpha_n != self.alpha_n or configuration.alpha_m != self.alpha_m:
             configuration = replace(configuration, alpha_n=self.alpha_n, alpha_m=self.alpha_m)
+        no_ellipsoids = configuration.geometry_ablation == "none"
         standardized, preprocessing = mean_impute_zscore(X)
         neighbors = compute_neighbors(standardized, configuration)
         density = run_abide_pak(neighbors.distances, neighbors.indices, configuration)
@@ -3669,6 +4180,10 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
         routing_neighbors = reciprocal if configuration.reciprocity_mode == "mutual" else candidate
         log_density = density.log_density
         log_density_error = density.log_density_error
+        if configuration.density_mode == "bmti":
+            log_density, log_density_error = run_bmti(
+                standardized, neighbors.distances, neighbors.indices, density
+            )
         if configuration.prominence_mode == "raw":
             prominence = np.asarray(log_density, dtype=np.float64).copy()
         elif configuration.prominence_mode == "lower_bound":
@@ -3704,51 +4219,73 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
             ascent_ranks = None
         validate_parent_forest(parent, prominence)
         micro_labels = labels_from_parent(parent)
-        ellipsoids, boundary_weights = fit_ellipsoids(
-            standardized,
-            micro_labels,
-            density.intrinsic_dimension,
-            routing_radius,
-            configuration.boundary_coverage,
-            configuration.epsilon,
-            spherical=configuration.geometry_mode == "spherical",
-            full_space=configuration.geometry_mode == "full",
-            reliability_blend=configuration.geometry_mode == "adaptive",
-            support_neighbors=(
-                routing_neighbors if configuration.topology_supported_ellipsoid else None
-            ),
-        )
-        geometry_calibration: dict[str, object] = {
-            "requested": configuration.geometry_mode,
-            "selected": configuration.geometry_mode,
-        }
-        if configuration.geometry_mode == "adaptive":
-            reliable_fraction = float(
-                np.mean([item.directional_reliability > 0 for item in ellipsoids])
+        if no_ellipsoids:
+            ellipsoids = []
+            boundary_weights = np.ones(standardized.shape[0], dtype=np.float64)
+            geometry_calibration = {
+                "requested": configuration.geometry_mode,
+                "selected": "disabled-no-ellipsoid",
+            }
+        else:
+            ellipsoids, boundary_weights = fit_ellipsoids(
+                standardized,
+                micro_labels,
+                density.intrinsic_dimension,
+                routing_radius,
+                configuration.boundary_coverage,
+                configuration.epsilon,
+                spherical=configuration.geometry_mode == "spherical",
+                full_space=configuration.geometry_mode == "full",
+                reliability_blend=configuration.geometry_mode == "adaptive",
+                support_neighbors=(
+                    routing_neighbors if configuration.topology_supported_ellipsoid else None
+                ),
+                oas_shrinkage_multiplier=configuration.oas_shrinkage_multiplier,
             )
-            reliability_threshold = 1.0 / np.sqrt(max(len(ellipsoids), 1))
-            if reliable_fraction > reliability_threshold:
-                ellipsoids, boundary_weights = fit_ellipsoids(
+            geometry_calibration: dict[str, object] = {
+                "requested": configuration.geometry_mode,
+                "selected": configuration.geometry_mode,
+            }
+            if configuration.geometry_mode == "adaptive":
+                reliable_fraction = float(
+                    np.mean([item.directional_reliability > 0 for item in ellipsoids])
+                )
+                reliability_threshold = 1.0 / np.sqrt(max(len(ellipsoids), 1))
+                if reliable_fraction > reliability_threshold:
+                    ellipsoids, boundary_weights = fit_ellipsoids(
+                        standardized,
+                        micro_labels,
+                        density.intrinsic_dimension,
+                        routing_radius,
+                        configuration.boundary_coverage,
+                        configuration.epsilon,
+                        spherical=False,
+                        full_space=False,
+                        reliability_blend=False,
+                        support_neighbors=(
+                            routing_neighbors
+                            if configuration.topology_supported_ellipsoid
+                            else None
+                        ),
+                        oas_shrinkage_multiplier=configuration.oas_shrinkage_multiplier,
+                    )
+                    geometry_calibration["selected"] = "intrinsic-supported"
+                else:
+                    geometry_calibration["selected"] = "shrinkage-blended"
+                geometry_calibration["reliable_fraction"] = reliable_fraction
+                geometry_calibration["reliability_threshold"] = reliability_threshold
+            if configuration.geometry_ablation == "spherical":
+                ellipsoids, boundary_weights = spherical_shape_control(
                     standardized,
-                    micro_labels,
-                    density.intrinsic_dimension,
-                    routing_radius,
+                    ellipsoids,
                     configuration.boundary_coverage,
                     configuration.epsilon,
-                    spherical=False,
-                    full_space=False,
-                    reliability_blend=False,
-                    support_neighbors=(
-                        routing_neighbors
-                        if configuration.topology_supported_ellipsoid
-                        else None
-                    ),
                 )
-                geometry_calibration["selected"] = "intrinsic-supported"
-            else:
-                geometry_calibration["selected"] = "shrinkage-blended"
-            geometry_calibration["reliable_fraction"] = reliable_fraction
-            geometry_calibration["reliability_threshold"] = reliability_threshold
+                geometry_calibration["reference_selected"] = geometry_calibration["selected"]
+                geometry_calibration["selected"] = "spherical-shape-control"
+                geometry_calibration["metric"] = "full-isotropic-variance-inverse-times-identity"
+                geometry_calibration["directional_support"] = "preserved-full-fit"
+                geometry_calibration["sample_support"] = "preserved-full-fit"
         micro_graph = build_micro_graph(
             standardized,
             micro_labels,
@@ -3764,6 +4301,7 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
             ascent_ranks=ascent_ranks,
             evidence=configuration.evidence,
             geometry_mode=configuration.ellipsoid_contact_mode,
+            geometry_ablation=configuration.geometry_ablation,
         )
         n_micro = int(micro_labels.max()) + 1
         effective_fusion_mode = configuration.fusion_mode
@@ -3844,7 +4382,8 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
             speciation_minimum_states = 1
             multi_axial_speciation = False
             if (
-                configuration.crossfit_ellipsoidal_speciation
+                not no_ellipsoids
+                and configuration.crossfit_ellipsoidal_speciation
                 and hubness_skewness > 1.0
             ):
                 speciation_p, speciation_diagnostics = crossfit_ellipsoidal_speciation(
@@ -4000,7 +4539,8 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
                 fusion_diagnostics.get("candidate_stability", np.inf)
             )
             if (
-                configuration.crossfit_ellipsoidal_speciation
+                not no_ellipsoids
+                and configuration.crossfit_ellipsoidal_speciation
                 and speciation_p is None
                 and candidate_stability <= configuration.epsilon
             ):
@@ -4119,6 +4659,7 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
                 standardized.shape[0],
                 configuration.boundary_coverage,
                 configuration.epsilon,
+                geometry_ablation=configuration.geometry_ablation,
             )
             fusion_history = []
         elif effective_fusion_mode == "none":
@@ -4161,71 +4702,31 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
                 "stability": stability_diagnostics,
             }
         micro_sizes = np.bincount(micro_labels, minlength=n_micro)
-        recurrence_minimum_states = int(
-            fusion_diagnostics.get("ellipsoidal_speciation", {}).get(
-                "final_state_lower_bound", 1
-            )
-        )
-        macro_by_micro, recurrence_diagnostics = recurrent_ellipsoidal_absorption(
-            standardized,
-            micro_labels,
-            macro_by_micro,
-            ellipsoids,
-            micro_graph,
-            epsilon=configuration.epsilon,
-            alpha=configuration.alpha_m,
-            permutations=configuration.null_permutations,
-            seed=configuration.random_seed,
-            minimum_states=recurrence_minimum_states,
-        )
-        q = int(
-            np.clip(
-                np.rint(density.intrinsic_dimension),
-                1,
-                standardized.shape[1],
-            )
-        )
-        underidentified, collapse_guard_diagnostics = (
-            certified_floor_is_geometrically_underidentified(
-                macro_by_micro,
+        if no_ellipsoids:
+            recurrence_minimum_states = 1
+            macro_by_micro, recurrence_diagnostics = recurrent_graph_flow_absorption(
                 micro_labels,
-                recurrence_diagnostics,
-                q + 2,
+                macro_by_micro,
+                micro_graph,
+                epsilon=configuration.epsilon,
+                alpha=configuration.alpha_m,
+                permutations=configuration.null_permutations,
+                seed=configuration.random_seed,
             )
-        )
-        collapse_guard_diagnostics["status"] = "not-triggered"
-        if (
-            configuration.certified_collapse_guard
-            and effective_fusion_mode == "correction"
-            and underidentified
-        ):
-            stability_preliminary, stability_preliminary_diagnostics = (
-                evidence_gap_components(
-                    n_micro,
-                    micro_graph,
-                    micro_sizes,
-                    np.asarray(
-                        [item.directional_reliability for item in ellipsoids],
-                        dtype=np.float64,
-                    ),
-                    standardized.shape[0],
-                    configuration.boundary_coverage,
-                    configuration.epsilon,
+            collapse_guard_diagnostics = {
+                "status": "disabled-no-ellipsoid",
+                "certified_minimum_states": 1,
+            }
+        else:
+            recurrence_minimum_states = int(
+                fusion_diagnostics.get("ellipsoidal_speciation", {}).get(
+                    "final_state_lower_bound", 1
                 )
             )
-            stability_preliminary, stability_guard_diagnostics = markov_stability_guard(
-                stability_preliminary,
-                n_micro,
-                micro_graph,
-                micro_sizes,
-                density.intrinsic_dimension,
-                configuration.random_seed,
-                configuration.epsilon,
-            )
-            stability_macro, stability_recurrence = recurrent_ellipsoidal_absorption(
+            macro_by_micro, recurrence_diagnostics = recurrent_ellipsoidal_absorption(
                 standardized,
                 micro_labels,
-                stability_preliminary,
+                macro_by_micro,
                 ellipsoids,
                 micro_graph,
                 epsilon=configuration.epsilon,
@@ -4234,46 +4735,102 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
                 seed=configuration.random_seed,
                 minimum_states=recurrence_minimum_states,
             )
-            stability_macro, set_flow_history = coarsen_to_certified_state_floor(
-                stability_macro,
-                micro_sizes,
-                micro_graph,
-                recurrence_minimum_states,
-                configuration.epsilon,
+            q = int(
+                np.clip(
+                    np.rint(density.intrinsic_dimension),
+                    1,
+                    standardized.shape[1],
+                )
             )
-            fallback_underidentified, fallback_support = (
+            underidentified, collapse_guard_diagnostics = (
                 certified_floor_is_geometrically_underidentified(
-                    stability_macro,
+                    macro_by_micro,
                     micro_labels,
-                    stability_recurrence,
+                    recurrence_diagnostics,
                     q + 2,
                 )
             )
-            fallback_clusters = int(np.unique(stability_macro).size)
-            accepted = bool(
-                not fallback_underidentified
-                and fallback_clusters >= recurrence_minimum_states
-                and int(fallback_support["minimum_cluster_points"]) >= q + 2
-            )
-            collapse_guard_diagnostics.update(
-                {
-                    "status": (
-                        "stability-fallback-accepted"
-                        if accepted
-                        else "stability-fallback-rejected"
-                    ),
-                    "certified_minimum_states": recurrence_minimum_states,
-                    "fallback_clusters": fallback_clusters,
-                    "fallback_support": fallback_support,
-                    "fallback_preliminary": stability_preliminary_diagnostics,
-                    "fallback_stability": stability_guard_diagnostics,
-                    "set_flow_coarsening": set_flow_history,
-                    "primary_recurrence": recurrence_diagnostics,
-                }
-            )
-            if accepted:
-                macro_by_micro = stability_macro
-                recurrence_diagnostics = stability_recurrence
+            collapse_guard_diagnostics["status"] = "not-triggered"
+            if (
+                configuration.certified_collapse_guard
+                and effective_fusion_mode == "correction"
+                and underidentified
+            ):
+                stability_preliminary, stability_preliminary_diagnostics = (
+                    evidence_gap_components(
+                        n_micro,
+                        micro_graph,
+                        micro_sizes,
+                        np.asarray(
+                            [item.directional_reliability for item in ellipsoids],
+                            dtype=np.float64,
+                        ),
+                        standardized.shape[0],
+                        configuration.boundary_coverage,
+                        configuration.epsilon,
+                    )
+                )
+                stability_preliminary, stability_guard_diagnostics = markov_stability_guard(
+                    stability_preliminary,
+                    n_micro,
+                    micro_graph,
+                    micro_sizes,
+                    density.intrinsic_dimension,
+                    configuration.random_seed,
+                    configuration.epsilon,
+                )
+                stability_macro, stability_recurrence = recurrent_ellipsoidal_absorption(
+                    standardized,
+                    micro_labels,
+                    stability_preliminary,
+                    ellipsoids,
+                    micro_graph,
+                    epsilon=configuration.epsilon,
+                    alpha=configuration.alpha_m,
+                    permutations=configuration.null_permutations,
+                    seed=configuration.random_seed,
+                    minimum_states=recurrence_minimum_states,
+                )
+                stability_macro, set_flow_history = coarsen_to_certified_state_floor(
+                    stability_macro,
+                    micro_sizes,
+                    micro_graph,
+                    recurrence_minimum_states,
+                    configuration.epsilon,
+                )
+                fallback_underidentified, fallback_support = (
+                    certified_floor_is_geometrically_underidentified(
+                        stability_macro,
+                        micro_labels,
+                        stability_recurrence,
+                        q + 2,
+                    )
+                )
+                fallback_clusters = int(np.unique(stability_macro).size)
+                accepted = bool(
+                    not fallback_underidentified
+                    and fallback_clusters >= recurrence_minimum_states
+                    and int(fallback_support["minimum_cluster_points"]) >= q + 2
+                )
+                collapse_guard_diagnostics.update(
+                    {
+                        "status": (
+                            "stability-fallback-accepted"
+                            if accepted
+                            else "stability-fallback-rejected"
+                        ),
+                        "certified_minimum_states": recurrence_minimum_states,
+                        "fallback_clusters": fallback_clusters,
+                        "fallback_support": fallback_support,
+                        "fallback_preliminary": stability_preliminary_diagnostics,
+                        "fallback_stability": stability_guard_diagnostics,
+                        "set_flow_coarsening": set_flow_history,
+                        "primary_recurrence": recurrence_diagnostics,
+                    }
+                )
+                if accepted:
+                    macro_by_micro = stability_macro
+                    recurrence_diagnostics = stability_recurrence
         fusion_diagnostics = {
             **fusion_diagnostics,
             "recurrent_ellipsoidal_absorption": recurrence_diagnostics,
@@ -4284,6 +4841,18 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
                 **fusion_diagnostics,
                 "automatic_fusion": automatic_fusion_diagnostics,
             }
+        if configuration.optional_repair:
+            sizes = np.bincount(micro_labels, minlength=n_micro)
+            small_cutoff = max(3, int(np.rint(density.intrinsic_dimension)) + 1)
+            for micro in np.flatnonzero(sizes < small_cutoff):
+                candidates_edges = [
+                    edge for edge in micro_graph if edge.left == micro or edge.right == micro
+                ]
+                if candidates_edges:
+                    strongest = max(candidates_edges, key=lambda edge: (edge.weight, -edge.left, -edge.right))
+                    other = strongest.right if strongest.left == micro else strongest.left
+                    macro_by_micro[micro] = macro_by_micro[other]
+            macro_by_micro = relabel_consecutive(macro_by_micro)
         labels = relabel_consecutive(macro_by_micro[micro_labels])
 
         for array in (labels, prominence, parent, micro_labels):
@@ -4312,15 +4881,44 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
             "dadapy_version": density.dadapy_version,
             "pak_optimized": density.pak_optimized,
             "pak_equal_shells": density.pak_equal_shells,
+            "density_estimation": {
+                "mode": configuration.density_mode,
+                "density_neighbors": density.density_neighbors,
+                "density_neighbors_requested": 30 if configuration.density_mode == "knn30" else None,
+                "official_error_source": (
+                    "existing BMTI adapter; PAk reference error when native error is absent"
+                    if configuration.density_mode == "bmti"
+                    else "DADApy native estimator return"
+                ),
+                "abide_kstar_preserved": True,
+                "routing_scale": configuration.routing_scale,
+                "pak_executed": configuration.density_mode != "knn30",
+                "neighbor_cache_expanded": False,
+            },
+            "oas_regularization_control": {
+                "requested_multiplier": configuration.oas_shrinkage_multiplier,
+                "applies_to": "fitted OAS covariance, precision, residual variance and directional evidence",
+                "local_models_disabled": no_ellipsoids,
+                "operational_covariance_components": sum(e.basis.shape[1] > 0 for e in ellipsoids),
+            },
             "prominence_nonfinite_repairs": prominence_repairs,
             "n_microcomponents": n_micro,
             "n_clusters": int(np.unique(labels).size),
-            "geometry": {
+            "geometry": ({
+                "calibration": geometry_calibration,
+                "adaptive_components": 0,
+                "isotropic_components": 0,
+                "rank_deficient_components": 0,
+                "mean_directional_reliability": None,
+                "median_directional_reliability": None,
+                "median_axis_ratio": None,
+                "median_oas_shrinkage": None,
+            } if no_ellipsoids else {
                 "calibration": geometry_calibration,
                 "adaptive_components": int(
                     sum(item.geometry_kind == "adaptive-reliability-blend" for item in ellipsoids)
                 ),
-                "isotropic_components": int(
+                "isotropic_components": len(ellipsoids) if configuration.geometry_ablation == "spherical" else int(
                     sum(item.directional_reliability == 0 for item in ellipsoids)
                 ),
                 "rank_deficient_components": int(sum(item.rank_deficient for item in ellipsoids)),
@@ -4334,7 +4932,7 @@ class AEDPCv2(ClusterMixin, BaseEstimator):
                 "median_oas_shrinkage": float(
                     np.median([item.oas_shrinkage for item in ellipsoids])
                 ),
-            },
+            }),
             "fusion": fusion_diagnostics,
             "runtime_seconds": time.perf_counter() - started,
             "python": platform.python_version(),
@@ -4657,12 +5255,148 @@ class AutomaticAEDPCv2(ClusterMixin, BaseEstimator):
     def diagnostics_(self) -> Mapping[str, object]:
         return self._diagnostics
 
-# Main algorithm entry points.
+# ============================================================================
+# Original module: aedpcv2/release.py
+# ============================================================================
+
+_ResearchConfig = AEDPCv2Config
+_ResearchEngine = AEDPCv2
+
+"""Restricted public release API for the single frozen AEDPCv2 method."""
+
+
+from dataclasses import asdict, dataclass
+from types import MappingProxyType
+from typing import Literal, Mapping
+
+from numpy.typing import ArrayLike, NDArray
+import numpy as np
+from sklearn.base import BaseEstimator, ClusterMixin
+
+
+
+@dataclass(frozen=True, slots=True)
+class PublicAEDPCv2Config:
+    """Public configuration with no algorithm-selection or target-cluster controls."""
+
+    alpha_n: float = 0.01
+    alpha_m: float = 0.05
+    neighbor_backend: Literal["auto", "exact", "hnsw"] = "auto"
+    random_seed: int = 20260824
+
+    def __post_init__(self) -> None:
+        if not 0 < self.alpha_n < 1:
+            raise ValueError("alpha_n must lie in (0, 1)")
+        if not 0 < self.alpha_m < 1:
+            raise ValueError("alpha_m must lie in (0, 1)")
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    def _research_config(self) -> _ResearchConfig:
+        return _ResearchConfig(
+            alpha_n=self.alpha_n,
+            alpha_m=self.alpha_m,
+            neighbor_backend=self.neighbor_backend,
+            random_seed=self.random_seed,
+        )
+
+
+class PublicAEDPCv2(ClusterMixin, BaseEstimator):
+    """Transductive no-K AEDPCv2 estimator with one frozen algorithm profile.
+
+    The public API intentionally exposes no density estimator, parent rule, geometry model,
+    evidence formula, fusion strategy, requested cluster count, or out-of-sample ``predict``.
+    Ablation runners import the internal research engine explicitly; the public estimator
+    rejects research configurations.
+    """
+
+    def __init__(
+        self,
+        alpha_n: float = 0.01,
+        alpha_m: float = 0.05,
+        neighbor_backend: Literal["auto", "exact", "hnsw"] = "auto",
+        random_seed: int = 20260824,
+        config: PublicAEDPCv2Config | None = None,
+    ) -> None:
+        self.alpha_n = alpha_n
+        self.alpha_m = alpha_m
+        self.neighbor_backend = neighbor_backend
+        self.random_seed = random_seed
+        self.config = config
+
+    def fit(self, X: ArrayLike, y: ArrayLike | None = None) -> "PublicAEDPCv2":
+        del y
+        public = self.config or PublicAEDPCv2Config(
+            alpha_n=self.alpha_n,
+            alpha_m=self.alpha_m,
+            neighbor_backend=self.neighbor_backend,
+            random_seed=self.random_seed,
+        )
+        if not isinstance(public, PublicAEDPCv2Config):
+            raise TypeError("public AEDPCv2 accepts only the restricted AEDPCv2Config")
+        self._engine = _ResearchEngine(
+            alpha_n=public.alpha_n,
+            alpha_m=public.alpha_m,
+            config=public._research_config(),
+        ).fit(X)
+        self.n_features_in_ = self._engine.n_features_in_
+        diagnostics = dict(self._engine.diagnostics_)
+        diagnostics["release_profile"] = {
+            "name": "r36-identifiable-conditional-retention-recurrence",
+            "public_config": public.to_dict(),
+            "algorithm_selection_controls": [],
+            "target_k": None,
+        }
+        self._diagnostics = MappingProxyType(diagnostics)
+        return self
+
+    def fit_predict(
+        self, X: ArrayLike, y: ArrayLike | None = None
+    ) -> NDArray[np.int64]:
+        return self.fit(X, y).labels_.copy()
+
+    @property
+    def labels_(self) -> NDArray[np.int64]:
+        return self._engine.labels_
+
+    @property
+    def prominence_(self) -> NDArray[np.float64]:
+        return self._engine.prominence_
+
+    @property
+    def parent_(self) -> NDArray[np.int64]:
+        return self._engine.parent_
+
+    @property
+    def microcomponent_labels_(self) -> NDArray[np.int64]:
+        return self._engine.microcomponent_labels_
+
+    @property
+    def ellipsoids_(self) -> tuple[Ellipsoid, ...]:
+        return self._engine.ellipsoids_
+
+    @property
+    def micro_graph_(self) -> tuple[MicroEdge, ...]:
+        return self._engine.micro_graph_
+
+    @property
+    def fusion_history_(
+        self,
+    ) -> tuple[FusionStep | MarkovCorrectionStep, ...]:
+        return self._engine.fusion_history_
+
+    @property
+    def diagnostics_(self) -> Mapping[str, object]:
+        return self._diagnostics
+
+# These aliases do not replace the core globals used by AutomaticAEDPCv2.
 AEDPC = AutomaticAEDPCv2
 AEDPCCore = AEDPCv2
 AEDPCConfig = AEDPCv2Config
-__version__ = "0.16.0"
+__version__ = '0.16.0'
+__source_sha256__ = 'bfca29603ecddd933b370d0604eea16bd0f56e9413da76b85f29b2ab82a9ef20'
 __all__ = [
     "AEDPC", "AEDPCCore", "AEDPCConfig", "AutomaticAEDPCv2",
-    "AEDPCv2", "AEDPCv2Config",
+    "AEDPCv2", "AEDPCv2Config", "PublicAEDPCv2", "PublicAEDPCv2Config",
 ]
