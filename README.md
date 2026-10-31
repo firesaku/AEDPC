@@ -18,6 +18,7 @@ AEDPC (Adaptive Ellipsoidal Density-Peak Clustering) makes that decision with lo
 
 - recovers all eight artificial reference partitions exactly;
 - highest adjusted Rand index (ARI) on all ten real-world and visual datasets, and 68 of 80 task–metric first places;
+- matched controls credit the local geometry with a mean ARI gain of 0.1439; on strongly bent Pendigits the full method keeps ARI 0.7820 while the variant without ellipsoids falls to near zero;
 - on STL10 (CLIP ViT-B/32 features), ARI rises from 0.3538 to 0.5514 with 66.00% less clustering time than the strongest comparator.
 
 > The paper is currently under review at *Pattern Recognition*. Citation details will be added here after publication.
@@ -76,7 +77,7 @@ Controls adopted in the paper:
 | Wine | 0.01 | 0.05 |
 | STL10 | 5.3e-06 | 0.002 |
 
-Neighbour search is exact for the tabular datasets. HTRU2, Rice and STL10 use HNSW with `M=16`, `efConstruction=200`, `efSearch=400` and deterministic insertion. Runs are single-threaded and take the seed from the configuration.
+Neighbour search is exact up to 3,000 observations. HTRU2 and Rice use HNSW with `M=16`, `efConstruction=200`, `efSearch=400` and deterministic insertion; WDBC, Libras Movement and Pendigits use exact search throughout, and STL10 uses exact search with 15 neighbours. Runs are single-threaded and take the seed from the configuration.
 
 The datasets are public (UCI Machine Learning Repository, the Clustering benchmarks collection and STL10). The preprocessed feature matrices used in the paper are available from the authors on request.
 
@@ -115,7 +116,7 @@ The animation runs AEDPC step by step on 434 points that form two interleaved cr
 `P = log-density − z · uncertainty`
 
 - **How it works:** Every point gets a density score. Each neighbourhood adapts to the data: large circles where points are sparse, small where they are dense.
-- **Why it matters:** Density decides which way every point will “flow” next. In the paper this is the biggest single factor (+0.44 ARI over a fixed-size neighbourhood).
+- **Why it matters:** Density decides which way every point will “flow” next. Reliable density gives reliable components for the geometry to work on; in the paper, a fixed-size neighbourhood instead lowers mean ARI by 0.44.
 - **Result in this run:** Neighbourhood radius; 0.046 (dense) to 0.318 (sparse)
 
 #### 3. Density ascent
